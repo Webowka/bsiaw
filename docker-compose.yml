@@ -1,0 +1,19 @@
+services:
+  web:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      # Azure PostgreSQL connection (set your actual connection string here)
+      # DATABASE_URL: postgresql://username:password@server.postgres.database.azure.com:5432/database?sslmode=require
+
+      # Or leave empty to test graceful database failure handling
+      DATABASE_URL: postgresql://user:password@localhost:5432/authdb
+
+      SECRET_KEY: your-secret-key-change-in-production-min-32-chars
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin123
+      ADMIN_EMAIL: admin@forum.local
