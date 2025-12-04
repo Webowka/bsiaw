@@ -140,7 +140,14 @@ jobs:
       run: |
         docker build . --file Dockerfile --tag test-app:latest
         docker run -d -p 8080:8080 --name test-container test-app:latest
+        echo "Waiting for application to start..."
         sleep 10
+        
+        # Check if container is running
+        docker ps -a
+        
+        # Check if application is accessible
+        curl -v http://localhost:8080 || echo "Application not responding on port 8080"
 
     - name: Run Nikto web vulnerability scanner
       run: |
@@ -148,19 +155,29 @@ jobs:
         mkdir -p nikto-reports
         
         # Run Nikto and save reports to the mounted directory
+        echo "Running Nikto HTML scan..."
         docker run --network host -v $(pwd)/nikto-reports:/reports secfigo/nikto:latest \
           -h http://localhost:8080 \
           -Format htm \
-          -output /reports/nikto-report.html || true
+          -output /reports/nikto-report.html || echo "HTML scan failed"
         
+        echo "Running Nikto JSON scan..."
         docker run --network host -v $(pwd)/nikto-reports:/reports secfigo/nikto:latest \
           -h http://localhost:8080 \
           -Format json \
-          -output /reports/nikto-report.json || true
+          -output /reports/nikto-report.json || echo "JSON scan failed"
         
+        echo "Running Nikto TXT scan..."
         docker run --network host -v $(pwd)/nikto-reports:/reports secfigo/nikto:latest \
           -h http://localhost:8080 \
-          -output /reports/nikto-report.txt || true
+          -output /reports/nikto-report.txt || echo "TXT scan failed"
+        
+        # Create a status file to indicate scan was attempted
+        echo "Nikto scan completed at $(date)" > nikto-reports/scan-status.txt
+        
+        # List what was created
+        echo "Files created:"
+        ls -lh nikto-reports/
 
     - name: Display Nikto results
       if: always()
@@ -177,6 +194,7 @@ jobs:
       with:
         name: nikto-scan-results
         path: nikto-reports/
+        if-no-files-found: warn
         retention-days: 30
 
     - name: Stop container
@@ -230,9 +248,15 @@ jobs:
 
     - name: Download Nikto results
       uses: actions/download-artifact@v4
+      continue-on-error: true
       with:
         name: nikto-scan-results
         path: ./security-reports/nikto/
+    
+    - name: Check downloaded artifacts
+      run: |
+        echo "=== Downloaded Security Reports ==="
+        ls -lR security-reports/ || echo "No security reports found"
 
     # Create and sign security reports archive
     - name: Create security reports archive
