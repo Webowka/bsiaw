@@ -66,19 +66,35 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
-    # Nikto scan
+    # ZAP scan
     - name: Start application container
       run: |
         docker run -d -p 8080:8080 --name test-app scan-image:latest
+        echo "Waiting for application to start..."
         sleep 10
+        
+        # Check container status
+        docker ps -a
+        
+        # Test connectivity
+        echo "Testing application endpoint..."
+        curl -v http://localhost:8080 || echo "Application not responding"
 
-    - name: Run Nikto scan
+    - name: Run OWASP ZAP scan
       run: |
-        mkdir -p nikto-reports
-        docker run --network host -v $(pwd)/nikto-reports:/reports secfigo/nikto:latest \
-          -h http://localhost:8080 \
-          -Format json \
-          -output /reports/nikto-report.json || echo "Nikto scan completed"
+        mkdir -p zap-reports
+        
+        # Run ZAP baseline scan
+        docker run --network host -v $(pwd)/zap-reports:/zap/wrk/:rw \
+          ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+          -t http://localhost:8080 \
+          -J zap-report.json \
+          -r zap-report.html \
+          || true
+        
+        # Check if reports were created
+        echo "ZAP scan results:"
+        ls -lh zap-reports/
 
     - name: Stop container
       if: always()
@@ -92,7 +108,7 @@ jobs:
       run: |
         mkdir -p security-reports
         mv trivy-results.json security-reports/
-        mv nikto-reports security-reports/
+        mv zap-reports security-reports/
         tar -czf security-reports.tar.gz security-reports/
         sha256sum security-reports.tar.gz > security-reports.tar.gz.sha256
         cosign sign-blob --yes \
