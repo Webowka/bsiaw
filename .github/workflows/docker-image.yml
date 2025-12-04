@@ -142,6 +142,6 @@ jobs:
       uses: sarisia/actions-status-discord@v1
       with:
         webhook: ${{ secrets.WEBHOOK_URL }}
-        title: "Docker Image Built Successfully"
+        title: "Changes made to repository were pushed!"
         description: "New Docker image has been built and pushed"
-        color: 0x00ff00
+        color: 0x5a03fc
