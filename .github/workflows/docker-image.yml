@@ -83,24 +83,21 @@ jobs:
     - name: Run OWASP ZAP scan
       run: |
         mkdir -p zap-reports
+        chmod 777 zap-reports
         
         # Verify app is accessible
         echo "Testing application before ZAP scan..."
         curl -I http://localhost:8080 || echo "Warning: App might not be responding"
         
-        # Run ZAP baseline scan - let it write to its default locations
+        # Run ZAP baseline scan directly to zap-reports directory
         echo "Starting ZAP scan..."
-        docker run --network host -v $(pwd):/zap/wrk/:rw \
+        docker run --network host -v $(pwd)/zap-reports:/zap/wrk/:rw \
           ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
           -t http://localhost:8080 \
           -J zap-report.json \
           -w zap-report.md \
           -r zap-report.html \
           || echo "ZAP scan completed"
-        
-        # Move reports to zap-reports directory
-        echo "Moving ZAP reports..."
-        mv zap-report.* zap-reports/ 2>/dev/null || echo "No ZAP reports to move"
         
         # Check what was created
         echo "Contents of zap-reports directory:"
