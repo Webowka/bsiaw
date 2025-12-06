@@ -69,9 +69,9 @@ jobs:
     # ZAP scan
     - name: Start application container
       run: |
-        docker run -d -p 8080:8080 --name test-app scan-image:latest
+        docker run -d --network host --name test-app scan-image:latest
         echo "Waiting for application to start..."
-        sleep 10
+        sleep 15
         
         # Check container status
         docker ps -a
