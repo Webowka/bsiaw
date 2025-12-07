@@ -50,7 +50,7 @@ async def clean_database(db_engine):
     yield
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def client():
     async with AsyncClient(base_url=BASE_URL, follow_redirects=False) as ac:
         yield ac

@@ -29,13 +29,13 @@ async def test_password_hashing(db_engine, clean_database):
 
     with db_engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO users (username, password_hash)
-            VALUES (:username, :password_hash)
-        """), {"username": "hashtest", "password_hash": hashed.decode()})
+            INSERT INTO users (username, hashed_password)
+            VALUES (:username, :hashed_password)
+        """), {"username": "hashtest", "hashed_password": hashed.decode()})
         conn.commit()
 
         result = conn.execute(text("""
-            SELECT password_hash FROM users WHERE username = :username
+            SELECT hashed_password FROM users WHERE username = :username
         """), {"username": "hashtest"})
 
         stored_hash = result.scalar()
@@ -52,16 +52,16 @@ async def test_password_hashing(db_engine, clean_database):
 async def test_database_constraint_unique_username(db_engine, clean_database):
     with db_engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO users (username, password_hash)
-            VALUES (:username, :password_hash)
-        """), {"username": "duplicate", "password_hash": "hash1"})
+            INSERT INTO users (username, hashed_password)
+            VALUES (:username, :hashed_password)
+        """), {"username": "duplicate", "hashed_password": "hash1"})
         conn.commit()
 
         try:
             conn.execute(text("""
-                INSERT INTO users (username, password_hash)
-                VALUES (:username, :password_hash)
-            """), {"username": "duplicate", "password_hash": "hash2"})
+                INSERT INTO users (username, hashed_password)
+                VALUES (:username, :hashed_password)
+            """), {"username": "duplicate", "hashed_password": "hash2"})
             conn.commit()
             assert False, "Baza powinna odrzucić duplikat"
         except Exception:
@@ -76,9 +76,9 @@ async def test_database_rollback(db_session):
     ).scalar()
 
     db_session.execute(text("""
-        INSERT INTO users (username, password_hash)
-        VALUES (:username, :password_hash)
-    """), {"username": "rollback_test", "password_hash": "hash"})
+        INSERT INTO users (username, hashed_password)
+        VALUES (:username, :hashed_password)
+    """), {"username": "rollback_test", "hashed_password": "hash"})
     db_session.commit()
     new_count = db_session.execute(
         text("SELECT COUNT(*) FROM users")
