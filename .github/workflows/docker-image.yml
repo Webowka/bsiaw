@@ -60,13 +60,15 @@ jobs:
     - name: Build Docker image
       run: docker build . --file Dockerfile --tag scan-image:latest
 
-    # Trivy scan
+    # Trivy scan - FAIL on vulnerabilities
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: 'scan-image:latest'
         format: 'json'
         output: 'trivy-results.json'
+        exit-code: '1'  # Fail on HIGH/CRITICAL vulnerabilities
+        severity: 'HIGH,CRITICAL'
 
     - name: Run Trivy SARIF scan
       uses: aquasecurity/trivy-action@master
@@ -81,7 +83,7 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
-    # ZAP scan
+    # ZAP scan - simplified startup and FAIL on issues
     - name: Start application container
       run: |
         docker run -d --network host --name test-app \
@@ -91,92 +93,71 @@ jobs:
           -e ADMIN_PASSWORD="admin123" \
           -e ADMIN_EMAIL="admin@forum.local" \
           scan-image:latest
+        
         echo "Waiting for application to start..."
         sleep 15
         
-        # Check container status
-        echo "=== Container Status ==="
-        docker ps -a
-        
-        # Check container logs
-        echo "=== Container Logs ==="
-        docker logs test-app
-        
-        # Test connectivity with retries
-        echo "=== Testing application endpoint ==="
-        for i in {1..10}; do
-          if curl -f http://localhost:8000; then
-            echo "Application is responding!"
-            break
-          else
-            echo "Attempt $i: Application not responding yet, waiting 3 seconds..."
-            sleep 3
-          fi
-        done
-        
-        # Final verification
-        echo "=== Final verification ==="
-        curl -v http://localhost:8000 || (echo "ERROR: Application failed to start" && docker logs test-app && exit 1)
+        # Simple connectivity check - fail if not responding
+        if ! curl -f http://localhost:8000; then
+          echo "ERROR: Application failed to start"
+          docker logs test-app
+          exit 1
+        fi
+        echo "Application is ready"
 
     - name: Run OWASP ZAP scan
       run: |
         mkdir -p zap-reports
         chmod 777 zap-reports
         
-        # Verify app is accessible
-        echo "Testing application before ZAP scan..."
-        curl -I http://localhost:8000 || echo "Warning: App might not be responding"
-        
-        # Run ZAP baseline scan directly to zap-reports directory
-        echo "Starting ZAP scan..."
+        # Run ZAP baseline scan - remove the || echo to let it fail properly
         docker run --network host -v $(pwd)/zap-reports:/zap/wrk/:rw \
           ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
           -t http://localhost:8000 \
           -J zap-report.json \
           -w zap-report.md \
-          -r zap-report.html \
-          || echo "ZAP scan completed"
+          -r zap-report.html
         
-        # Check what was created
-        echo "Contents of zap-reports directory:"
-        ls -lha zap-reports/
-        
-        # Show report content if available
-        if [ -f zap-reports/zap-report.md ]; then
-          echo "=== ZAP Report Summary ==="
-          head -30 zap-reports/zap-report.md
-        else
-          echo "No reports generated - creating placeholder"
-          echo "ZAP scan was attempted but produced no output" > zap-reports/scan-log.txt
+        # Verify reports were created
+        if [ ! -f zap-reports/zap-report.json ]; then
+          echo "ERROR: ZAP scan failed to produce reports"
+          exit 1
         fi
 
     - name: Stop container
       if: always()
       run: docker stop test-app && docker rm test-app
 
-    # Sign artifacts
+    # Sign artifacts with restricted access
     - name: Install Cosign
       uses: sigstore/cosign-installer@v3.5.0
 
     - name: Create and sign security reports
       run: |
+        # Generate date stamp for artifact naming
+        DATE_STAMP=$(date +%Y%m%d-%H%M%S)
+        ARTIFACT_NAME="security-reports-${DATE_STAMP}"
+        
         mkdir -p security-reports
         mv trivy-results.json security-reports/
         mv zap-reports security-reports/
-        tar -czf security-reports.tar.gz security-reports/
-        sha256sum security-reports.tar.gz > security-reports.tar.gz.sha256
+        tar -czf ${ARTIFACT_NAME}.tar.gz security-reports/
+        sha256sum ${ARTIFACT_NAME}.tar.gz > ${ARTIFACT_NAME}.tar.gz.sha256
         cosign sign-blob --yes \
-          --bundle security-reports.tar.gz.bundle \
-          security-reports.tar.gz
+          --bundle ${ARTIFACT_NAME}.tar.gz.bundle \
+          ${ARTIFACT_NAME}.tar.gz
+        
+        # Save artifact name for upload step
+        echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_ENV
 
     - name: Upload signed artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: signed-security-reports
+        name: ${{ env.ARTIFACT_NAME }}
         path: |
-          security-reports.tar.gz
-          security-reports.tar.gz.sha256
-          security-reports.tar.gz.bundle
+          ${{ env.ARTIFACT_NAME }}.tar.gz
+          ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+          ${{ env.ARTIFACT_NAME }}.tar.gz.bundle
         retention-days: 90
 
   notify-discord:
