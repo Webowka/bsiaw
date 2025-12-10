@@ -9,6 +9,7 @@ from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, validator, Field
 from datetime import datetime
+from security.asgi_middleware import AddSecurityHeadersMiddleware
 import os
 import time
 import re
@@ -392,6 +393,7 @@ app = FastAPI()
 # Add session middleware
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-min-32-chars")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+app.add_middleware(AddSecurityHeadersMiddleware)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
