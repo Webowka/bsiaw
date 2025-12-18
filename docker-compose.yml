@@ -1,19 +1,35 @@
+version: "3.8"
+
 services:
   web:
     build: .
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
     volumes:
       - .:/app
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
-      # Azure PostgreSQL connection (set your actual connection string here)
-      # DATABASE_URL: postgresql://username:password@server.postgres.database.azure.com:5432/database?sslmode=require
-
-      # Or leave empty to test graceful database failure handling
       DATABASE_URL: postgresql://user:password@localhost:5432/authdb
-
       SECRET_KEY: your-secret-key-change-in-production-min-32-chars
       ADMIN_USERNAME: admin
       ADMIN_PASSWORD: admin123
       ADMIN_EMAIL: admin@forum.local
+      ENV: production
+    networks:
+      - webnet
+
+  nginx:
+    image: nginx:stable
+    depends_on:
+      - web
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks:
+      - webnet
+
+networks:
+  webnet:
+    driver: bridge
