@@ -20,6 +20,40 @@ import uuid
 import shutil
 import logging
 from pathlib import Path
+from collections import defaultdict
+from threading import Lock
+
+# Rate limiting implementation
+class RateLimiter:
+    """Simple in-memory rate limiter"""
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.lock = Lock()
+    
+    def is_allowed(self, key: str, max_requests: int, window_seconds: int) -> bool:
+        """Check if request is allowed under rate limit"""
+        now = time.time()
+        with self.lock:
+            # Remove old requests outside the window
+            self.requests[key] = [req_time for req_time in self.requests[key] 
+                                 if now - req_time < window_seconds]
+            
+            # Check if under limit
+            if len(self.requests[key]) < max_requests:
+                self.requests[key].append(now)
+                return True
+            return False
+
+rate_limiter = RateLimiter()
+
+def check_rate_limit(request: Request, max_requests: int = 100, window_seconds: int = 60):
+    """Dependency to check rate limits"""
+    client_ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.is_allowed(client_ip, max_requests, window_seconds):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please try again later."
+        )
 
 # Configure logging for security events
 logging.basicConfig(
@@ -419,6 +453,80 @@ initialize_database()
 
 app = FastAPI()
 
+# Custom exception handler to mask internal errors
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    Global exception handler that masks internal errors
+    and logs them securely without exposing details to users
+    """
+    # Log the full error internally
+    security_logger.error(
+        f"Unhandled exception: {type(exc).__name__}",
+        exc_info=True,
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+            "client": request.client.host if request.client else "unknown"
+        }
+    )
+    
+    # Return generic error to user (no stack trace)
+    return templates.TemplateResponse(
+        "error.html",
+        {
+            "request": request,
+            "error_message": "An unexpected error occurred. Please try again later.",
+            "error_code": 500
+        },
+        status_code=500
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with user-friendly messages"""
+    # Log HTTP errors
+    if exc.status_code >= 500:
+        security_logger.error(
+            f"HTTP {exc.status_code}: {exc.detail}",
+            extra={
+                "path": request.url.path,
+                "method": request.method,
+                "client": request.client.host if request.client else "unknown"
+            }
+        )
+    
+    # Map status codes to user-friendly messages
+    error_messages = {
+        400: "Invalid request. Please check your input.",
+        401: "Authentication required. Please log in.",
+        403: "Access denied. You don't have permission to access this resource.",
+        404: "The requested resource was not found.",
+        429: "Too many requests. Please slow down and try again later.",
+        500: "An internal error occurred. Please try again later.",
+        503: "Service temporarily unavailable. Please try again later."
+    }
+    
+    user_message = error_messages.get(exc.status_code, "An error occurred.")
+    
+    # For API endpoints, return JSON
+    if request.url.path.startswith("/api/") or "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": user_message}
+        )
+    
+    # For web pages, return HTML
+    return templates.TemplateResponse(
+        "error.html",
+        {
+            "request": request,
+            "error_message": user_message,
+            "error_code": exc.status_code
+        },
+        status_code=exc.status_code
+    )
+
 # Add session middleware with secure cookie parameters
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-min-32-chars")
 SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
@@ -554,7 +662,7 @@ async def register_page(request: Request):
     })
 
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=5, window_seconds=300))])
 async def register(
     request: Request,
     username: str = Form(...),
@@ -653,7 +761,7 @@ async def login_page(request: Request):
     })
 
 
-@app.post("/login")
+@app.post("/login", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=10, window_seconds=300))])
 async def login(
     request: Request,
     username: str = Form(...),
@@ -962,7 +1070,7 @@ async def create_page(
     )
 
 
-@app.post("/create")
+@app.post("/create", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=20, window_seconds=60))])
 async def create(
     title: str = Form(...),
     tags: str = Form(""),
@@ -1106,7 +1214,7 @@ async def react_to_post(
         db.commit()
         return JSONResponse({"status": "success", "action": "added"})
 
-@app.post("/post/{post_id}/comment")
+@app.post("/post/{post_id}/comment", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=30, window_seconds=60))])
 async def add_comment(
     post_id: int,
     content: str = Form(...),
