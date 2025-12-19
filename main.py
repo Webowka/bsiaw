@@ -425,6 +425,11 @@ SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
 # Detect if running in production (HTTPS available)
 is_production = os.getenv("ENVIRONMENT", "development") == "production"
 
+# Add middleware in correct order (they execute in REVERSE order)
+# Execution order will be: SessionMiddleware -> SessionTimeoutMiddleware -> CSRFMiddleware -> SecurityHeaders
+app.add_middleware(AddSecurityHeadersMiddleware)
+app.add_middleware(CSRFMiddleware, secret_key=SECRET_KEY)
+app.add_middleware(SessionTimeoutMiddleware, timeout_minutes=SESSION_TIMEOUT_MINUTES)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -433,9 +438,6 @@ app.add_middleware(
     same_site="strict",  # CSRF protection - strict same-site policy
     session_cookie="session"  # Cookie name
 )
-app.add_middleware(SessionTimeoutMiddleware, timeout_minutes=SESSION_TIMEOUT_MINUTES)
-app.add_middleware(CSRFMiddleware, secret_key=SECRET_KEY)
-app.add_middleware(AddSecurityHeadersMiddleware)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
