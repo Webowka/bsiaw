@@ -761,7 +761,7 @@ async def login_page(request: Request):
     })
 
 
-@app.post("/login", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=10, window_seconds=300))])
+@app.post("/login", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=3, window_seconds=300))])
 async def login(
     request: Request,
     username: str = Form(...),
