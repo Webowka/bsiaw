@@ -24,6 +24,10 @@ class AddSecurityHeadersMiddleware(BaseHTTPMiddleware):
         if "X-Frame-Options" not in response.headers:
             response.headers["X-Frame-Options"] = "DENY"
 
+        # Referrer-Policy - control Referer header leakage
+        if "Referrer-Policy" not in response.headers:
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
         # Content Security Policy - Comprehensive protection against XSS and injection attacks
         if "Content-Security-Policy" not in response.headers:
             # Define a strict CSP without unsafe-inline
