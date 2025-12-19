@@ -8,15 +8,28 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, validator, Field
-from datetime import datetime
+from datetime import datetime, timedelta
 from security.asgi_middleware import AddSecurityHeadersMiddleware
 from security.csrf import CSRFMiddleware, generate_csrf_token
+from security.session_management import SessionTimeoutMiddleware, init_session
 import os
 import time
 import re
 import uuid
 import shutil
+import logging
 from pathlib import Path
+
+# Configure logging for security events
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('security.log'),
+        logging.StreamHandler()
+    ]
+)
+security_logger = logging.getLogger('security')
 
 # Database setup - REQUIRE environment variable, no localhost fallback
 DATABASE_URL = (
@@ -88,6 +101,20 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     is_admin = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    password_changed_at = Column(DateTime, default=datetime.utcnow)
+    password_history = Column(Text, default="")  # JSON list of previous password hashes
+    force_password_change = Column(Integer, default=0)  # Flag to force password change
+
+class LoginAttempt(Base):
+    """Model for tracking login attempts for security monitoring"""
+    __tablename__ = "login_attempts"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, index=True)
+    success = Column(Integer)  # 1 for success, 0 for failure
+    ip_address = Column(String)
+    user_agent = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    failure_reason = Column(String)  # e.g., "invalid_username", "invalid_password"
 
 class PostTag(Base):
     __tablename__ = "post_tags"
@@ -391,9 +418,22 @@ initialize_database()
 
 app = FastAPI()
 
-# Add session middleware
+# Add session middleware with secure cookie parameters
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-min-32-chars")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+
+# Detect if running in production (HTTPS available)
+is_production = os.getenv("ENVIRONMENT", "development") == "production"
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    max_age=SESSION_TIMEOUT_MINUTES * 60,  # Session cookie lifetime in seconds
+    https_only=is_production,  # Secure flag - only send over HTTPS in production
+    same_site="strict",  # CSRF protection - strict same-site policy
+    session_cookie="session"  # Cookie name
+)
+app.add_middleware(SessionTimeoutMiddleware, timeout_minutes=SESSION_TIMEOUT_MINUTES)
 app.add_middleware(CSRFMiddleware, secret_key=SECRET_KEY)
 app.add_middleware(AddSecurityHeadersMiddleware)
 
@@ -589,10 +629,15 @@ async def register(
     new_user = User(
         username=validated_data.username,
         hashed_password=hashed_password,
-        email=validated_data.email
+        email=validated_data.email,
+        password_changed_at=datetime.utcnow(),
+        password_history="[]",  # Empty JSON array
+        force_password_change=0
     )
     db.add(new_user)
     db.commit()
+
+    security_logger.info(f"New user registered: {validated_data.username}")
 
     return RedirectResponse(url="/login", status_code=303)
 
@@ -613,19 +658,37 @@ async def login(
     db: Session = Depends(get_db)
 ):
     """
-    LOGOWANIE Z WALIDACJĄ
+    LOGOWANIE Z WALIDACJĄ I MONITOROWANIEM
 
     Waliduje:
     1. Obecność obu pól
     2. Podstawowa długość
     3. Istnienie użytkownika
     4. Poprawność hasła
+    5. Loguje wszystkie próby logowania (sukces i porażka)
+    6. Sprawdza czy hasło wymaga zmiany
     """
+
+    # Get client info for logging
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
 
     # Walidacja formatu
     try:
         validated_data = LoginRequest(username=username, password=password)
     except Exception as e:
+        # Log failed attempt - invalid format
+        login_attempt = LoginAttempt(
+            username=username[:50],  # Limit length for safety
+            success=0,
+            ip_address=client_ip,
+            user_agent=user_agent[:200],
+            failure_reason="invalid_format"
+        )
+        db.add(login_attempt)
+        db.commit()
+        security_logger.warning(f"Failed login attempt - invalid format: {username} from {client_ip}")
+
         return templates.TemplateResponse(
             "login.html",
             {
@@ -641,6 +704,18 @@ async def login(
     ).first()
 
     if not user:
+        # Log failed attempt - user not found
+        login_attempt = LoginAttempt(
+            username=validated_data.username,
+            success=0,
+            ip_address=client_ip,
+            user_agent=user_agent[:200],
+            failure_reason="invalid_username"
+        )
+        db.add(login_attempt)
+        db.commit()
+        security_logger.warning(f"Failed login attempt - invalid username: {validated_data.username} from {client_ip}")
+
         return templates.TemplateResponse(
             "login.html",
             {
@@ -652,6 +727,18 @@ async def login(
 
     # Weryfikacja hasła
     if not pwd_context.verify(validated_data.password, user.hashed_password):
+        # Log failed attempt - wrong password
+        login_attempt = LoginAttempt(
+            username=validated_data.username,
+            success=0,
+            ip_address=client_ip,
+            user_agent=user_agent[:200],
+            failure_reason="invalid_password"
+        )
+        db.add(login_attempt)
+        db.commit()
+        security_logger.warning(f"Failed login attempt - wrong password: {validated_data.username} from {client_ip}")
+
         return templates.TemplateResponse(
             "login.html",
             {
@@ -661,17 +748,174 @@ async def login(
             }
         )
 
-    # Tworzenie sesji
-    request.session["user_id"] = user.id
-    request.session["username"] = user.username
+    # Check if password needs rotation (older than 90 days)
+    PASSWORD_MAX_AGE_DAYS = 90
+    if user.password_changed_at:
+        password_age = datetime.utcnow() - user.password_changed_at
+        if password_age.days > PASSWORD_MAX_AGE_DAYS:
+            user.force_password_change = 1
+            db.commit()
+            security_logger.info(f"User {user.username} password expired ({password_age.days} days old)")
+
+    # Log successful login
+    login_attempt = LoginAttempt(
+        username=validated_data.username,
+        success=1,
+        ip_address=client_ip,
+        user_agent=user_agent[:200],
+        failure_reason=None
+    )
+    db.add(login_attempt)
+    db.commit()
+    security_logger.info(f"Successful login: {validated_data.username} from {client_ip}")
+
+    # Tworzenie sesji z bezpiecznymi parametrami
+    init_session(request, user.id, user.username)
+
+    # Check if password change is forced
+    if user.force_password_change == 1:
+        return RedirectResponse(url="/change-password?required=true", status_code=303)
 
     return RedirectResponse(url="/main", status_code=303)
 
 
 @app.get("/logout")
 async def logout(request: Request):
+    username = request.session.get("username", "unknown")
     request.session.clear()
+    security_logger.info(f"User logged out: {username}")
     return RedirectResponse(url="/login", status_code=303)
+
+
+@app.get("/change-password", response_class=HTMLResponse)
+async def change_password_page(
+    request: Request,
+    required: bool = False,
+    current_user: User = Depends(get_current_user)
+):
+    """Display password change page"""
+    return templates.TemplateResponse(
+        "change_password.html",
+        {
+            "request": request,
+            "username": current_user.username,
+            "required": required
+        }
+    )
+
+
+@app.post("/change-password")
+async def change_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Change user password with security checks:
+    - Verify current password
+    - Validate new password strength
+    - Check password history to prevent reuse
+    - Update password_changed_at timestamp
+    """
+    import json as json_lib
+
+    # Verify current password
+    if not pwd_context.verify(current_password, current_user.hashed_password):
+        return templates.TemplateResponse(
+            "change_password.html",
+            {
+                "request": request,
+                "error": "Current password is incorrect",
+                "username": current_user.username
+            }
+        )
+
+    # Check if new passwords match
+    if new_password != confirm_password:
+        return templates.TemplateResponse(
+            "change_password.html",
+            {
+                "request": request,
+                "error": "New passwords do not match",
+                "username": current_user.username
+            }
+        )
+
+    # Validate new password strength
+    try:
+        validated_password = RegisterRequest(
+            username=current_user.username,
+            password=new_password,
+            email=current_user.email
+        ).password
+    except Exception as e:
+        error_messages = []
+        if hasattr(e, 'errors'):
+            for error in e.errors():
+                if error['loc'][0] == 'password':
+                    error_messages.append(error['msg'])
+        return templates.TemplateResponse(
+            "change_password.html",
+            {
+                "request": request,
+                "error": " | ".join(error_messages) if error_messages else "Password does not meet requirements",
+                "username": current_user.username
+            }
+        )
+
+    # Check password history (prevent reuse of last 5 passwords)
+    PASSWORD_HISTORY_COUNT = 5
+    try:
+        password_history = json_lib.loads(current_user.password_history or "[]")
+    except:
+        password_history = []
+
+    # Check if new password matches any in history
+    for old_hash in password_history:
+        if pwd_context.verify(new_password, old_hash):
+            return templates.TemplateResponse(
+                "change_password.html",
+                {
+                    "request": request,
+                    "error": f"Cannot reuse any of your last {PASSWORD_HISTORY_COUNT} passwords",
+                    "username": current_user.username
+                }
+            )
+
+    # Check if new password is same as current
+    if pwd_context.verify(new_password, current_user.hashed_password):
+        return templates.TemplateResponse(
+            "change_password.html",
+            {
+                "request": request,
+                "error": "New password must be different from current password",
+                "username": current_user.username
+            }
+        )
+
+    # Update password history
+    password_history.append(current_user.hashed_password)
+    # Keep only last N passwords
+    password_history = password_history[-PASSWORD_HISTORY_COUNT:]
+
+    # Hash new password
+    new_hashed_password = pwd_context.hash(new_password)
+
+    # Update user record
+    current_user.hashed_password = new_hashed_password
+    current_user.password_changed_at = datetime.utcnow()
+    current_user.password_history = json_lib.dumps(password_history)
+    current_user.force_password_change = 0
+    db.commit()
+
+    security_logger.info(f"Password changed for user: {current_user.username}")
+
+    # Clear session and redirect to login
+    request.session.clear()
+    return RedirectResponse(url="/login?message=Password changed successfully. Please log in with your new password.", status_code=303)
 
 
 @app.get("/main", response_class=HTMLResponse)
