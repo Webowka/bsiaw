@@ -24,7 +24,8 @@ from collections import defaultdict
 from threading import Lock
 
 # ===== RATE LIMITING OPARTY NA UŻYTKOWNIKU =====
-# Zamień linie 27-143 na ten kod
+# UWAGA: Te funkcje muszą być PRZED definicją dependency functions,
+# ale PO definicji modeli i SessionLocal
 
 class UserRateLimiter:
     """Simple rate limiter based on username"""
@@ -92,10 +93,45 @@ class UserRateLimiter:
             db.close()
 
 
+# Inicjalizacja rate limitera
 rate_limiter = UserRateLimiter()
 
 
-# ===== DEPENDENCY FUNCTIONS =====
+# ===== DEPENDENCY: GET DATABASE =====
+def get_db():
+    """
+    Database session dependency with connection check.
+    Raises HTTPException if database is not connected.
+    """
+    if not db_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is currently unavailable. Please try again later."
+        )
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ===== DEPENDENCY: GET CURRENT USER =====
+def get_current_user(request: Request, db: Session = Depends(get_db)):
+    """Get current authenticated user from session"""
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+
+# ===== RATE LIMITING DEPENDENCY FUNCTIONS =====
+# UWAGA: Te funkcje muszą być PO definicji get_current_user()
+
 async def rate_limit_register(request: Request):
     """Rate limit: 5 registrations per 5 minutes per IP"""
     # Dla rejestracji użyj IP (bo user jeszcze nie istnieje)
@@ -105,8 +141,6 @@ async def rate_limit_register(request: Request):
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
-    
-    key = f"/register:{client_ip}"
     
     if not rate_limiter.is_allowed(client_ip, "/register", max_requests=5, window_seconds=300):
         raise HTTPException(
@@ -148,46 +182,7 @@ async def rate_limit_comment(request: Request, current_user: User = Depends(get_
             status_code=429,
             detail="Too many comments. Please wait 1 minute."
         )
-
-
-rate_limiter = DatabaseRateLimiter()
-
-
-# ===== ASYNC DEPENDENCY FUNCTIONS - BEZ SKIPOWANIA =====
-async def rate_limit_register(request: Request):
-    """Rate limit: 5 registrations per 5 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=5, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many registration attempts. Please wait 5 minutes."
-        )
-
-
-async def rate_limit_login(request: Request):
-    """Rate limit: 3 login attempts per 5 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many login attempts. Please wait 5 minutes."
-        )
-
-
-async def rate_limit_create_post(request: Request):
-    """Rate limit: 3 posts per 3 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=180):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many posts. Please wait 3 minutes before posting again."
-        )
-
-
-async def rate_limit_comment(request: Request):
-    """Rate limit: 30 comments per minute"""
-    if not rate_limiter.is_allowed(request, max_requests=30, window_seconds=60):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many comments. Please wait 1 minute."
-        )
+        
 # Configure logging for security events - console only
 logging.basicConfig(
     level=logging.INFO,
@@ -760,18 +755,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-# Get current user from session
-def get_current_user(request: Request, db: Session = Depends(get_db)):
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    return user
 
 
 # ═══════════════════════════════════════════════════════════
