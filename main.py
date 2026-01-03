@@ -74,7 +74,7 @@ def rate_limit_login(request: Request):
 
 def rate_limit_create_post(request: Request):
     """Rate limit dependency for create post endpoint"""
-    return check_rate_limit(request, max_requests=20, window_seconds=60)
+    return check_rate_limit(request, max_requests=3, window_seconds=180)
 
 def rate_limit_comment(request: Request):
     """Rate limit dependency for comment endpoint"""
