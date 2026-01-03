@@ -55,6 +55,22 @@ def check_rate_limit(request: Request, max_requests: int = 100, window_seconds: 
             detail="Too many requests. Please try again later."
         )
 
+def rate_limit_register(request: Request):
+    """Rate limit dependency for register endpoint"""
+    return check_rate_limit(request, max_requests=5, window_seconds=300)
+
+def rate_limit_login(request: Request):
+    """Rate limit dependency for login endpoint"""
+    return check_rate_limit(request, max_requests=3, window_seconds=300)
+
+def rate_limit_create_post(request: Request):
+    """Rate limit dependency for create post endpoint"""
+    return check_rate_limit(request, max_requests=20, window_seconds=60)
+
+def rate_limit_comment(request: Request):
+    """Rate limit dependency for comment endpoint"""
+    return check_rate_limit(request, max_requests=30, window_seconds=60)
+
 # Configure logging for security events
 logging.basicConfig(
     level=logging.INFO,
@@ -662,7 +678,7 @@ async def register_page(request: Request):
     })
 
 
-@app.post("/register", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=5, window_seconds=300))])
+@app.post("/register", dependencies=[Depends(rate_limit_register)])
 async def register(
     request: Request,
     username: str = Form(...),
@@ -761,7 +777,7 @@ async def login_page(request: Request):
     })
 
 
-@app.post("/login", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=3, window_seconds=300))])
+@app.post("/login", dependencies=[Depends(rate_limit_login)])
 async def login(
     request: Request,
     username: str = Form(...),
@@ -1070,7 +1086,7 @@ async def create_page(
     )
 
 
-@app.post("/create", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=20, window_seconds=60))])
+@app.post("/create", dependencies=[Depends(rate_limit_create_post)])
 async def create(
     title: str = Form(...),
     tags: str = Form(""),
@@ -1213,7 +1229,7 @@ async def react_to_post(
         db.commit()
         return JSONResponse({"status": "success", "action": "added"})
 
-@app.post("/post/{post_id}/comment", dependencies=[Depends(lambda r: check_rate_limit(r, max_requests=30, window_seconds=60))])
+@app.post("/post/{post_id}/comment", dependencies=[Depends(rate_limit_comment)])
 async def add_comment(
     post_id: int,
     content: str = Form(...),
