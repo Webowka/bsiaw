@@ -23,129 +23,6 @@ from pathlib import Path
 from collections import defaultdict
 from threading import Lock
 
-# ===== RATE LIMITING Z POSTGRESQL - ZAWSZE AKTYWNY =====
-
-class DatabaseRateLimiter:
-    """Rate limiter using PostgreSQL database"""
-    
-    def _get_client_ip(self, request: Request) -> str:
-        """Get real client IP from Azure proxy headers"""
-        forwarded_for = request.headers.get("X-Forwarded-For")
-        if forwarded_for:
-            return forwarded_for.split(",")[0].strip()
-        
-        real_ip = request.headers.get("X-Real-IP")
-        if real_ip:
-            return real_ip.strip()
-        
-        azure_client_ip = request.headers.get("X-Azure-ClientIP")
-        if azure_client_ip:
-            return azure_client_ip.strip()
-        
-        return request.client.host if request.client else "unknown"
-    
-    def is_allowed(self, request: Request, max_requests: int, window_seconds: int) -> bool:
-        """Check if request is allowed under rate limit"""
-        client_ip = self._get_client_ip(request)
-        endpoint = request.url.path
-        key = f"{endpoint}:{client_ip}"
-        
-        now = datetime.utcnow()
-        window_start = now - timedelta(seconds=window_seconds)
-        
-        # Get database session
-        db = SessionLocal()
-        
-        try:
-            # RateLimitEntry będzie dostępny gdy tabela zostanie utworzona
-            # Sprawdź czy tabela istnieje
-            from sqlalchemy import inspect
-            inspector = inspect(db.bind)
-            if 'rate_limits' not in inspector.get_table_names():
-                print("⚠ Rate limits table doesn't exist yet - skipping")
-                return True
-            
-            # Clean old entries
-            db.execute(
-                """DELETE FROM rate_limits 
-                   WHERE key = :key AND request_time < :window_start""",
-                {"key": key, "window_start": window_start}
-            )
-            
-            # Count requests
-            result = db.execute(
-                """SELECT COUNT(*) FROM rate_limits 
-                   WHERE key = :key AND request_time >= :window_start""",
-                {"key": key, "window_start": window_start}
-            )
-            count = result.scalar()
-            
-            print(f"\n=== Rate Limit Check ===")
-            print(f"Endpoint: {endpoint}")
-            print(f"Client IP: {client_ip}")
-            print(f"Current requests: {count}/{max_requests}")
-            
-            if count < max_requests:
-                # Add new entry
-                db.execute(
-                    """INSERT INTO rate_limits (key, request_time) 
-                       VALUES (:key, :now)""",
-                    {"key": key, "now": now}
-                )
-                db.commit()
-                print(f"✓ Request allowed ({count + 1}/{max_requests})")
-                return True
-            else:
-                print(f"✗ Rate limit exceeded!")
-                return False
-                
-        except Exception as e:
-            print(f"Rate limit error: {e}")
-            db.rollback()
-            # Fail-open: allow request if there's an error
-            return True
-        finally:
-            db.close()
-
-
-rate_limiter = DatabaseRateLimiter()
-
-
-# ===== ASYNC DEPENDENCY FUNCTIONS - BEZ SKIPOWANIA =====
-async def rate_limit_register(request: Request):
-    """Rate limit: 5 registrations per 5 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=5, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many registration attempts. Please wait 5 minutes."
-        )
-
-
-async def rate_limit_login(request: Request):
-    """Rate limit: 3 login attempts per 5 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many login attempts. Please wait 5 minutes."
-        )
-
-
-async def rate_limit_create_post(request: Request):
-    """Rate limit: 3 posts per 3 minutes"""
-    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=180):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many posts. Please wait 3 minutes before posting again."
-        )
-
-
-async def rate_limit_comment(request: Request):
-    """Rate limit: 30 comments per minute"""
-    if not rate_limiter.is_allowed(request, max_requests=30, window_seconds=60):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many comments. Please wait 1 minute."
-        )
 # Configure logging for security events - console only
 logging.basicConfig(
     level=logging.INFO,
@@ -155,19 +32,6 @@ logging.basicConfig(
     ]
 )
 security_logger = logging.getLogger('security')
-
-# Database setup - REQUIRE environment variable, no localhost fallback
-DATABASE_URL = (
-    os.getenv("DATABASE_URL") or
-    os.getenv("POSTGRESQLCONNSTR_DEFAULTCONNECTION")
-)
-
-# Validate that DATABASE_URL is set BEFORE creating engine
-if not DATABASE_URL:
-    import sys
-    sys.exit(1)
-
-print(f"✓ DATABASE_URL found: {DATABASE_URL[:30]}...") # Show first 30 chars for verification
 
 # Database setup - REQUIRE environment variable, no localhost fallback
 DATABASE_URL = (
@@ -463,6 +327,170 @@ class PostRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
+# RATE LIMITING - MUSI BYĆ PO DEFINICJI WSZYSTKICH MODELI
+# ═══════════════════════════════════════════════════════════
+
+class UserRateLimiter:
+    """Simple rate limiter based on username"""
+    
+    def is_allowed(self, username: str, endpoint: str, max_requests: int, window_seconds: int) -> bool:
+        """Check if user is allowed to make request"""
+        key = f"{endpoint}:{username}"
+        
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=window_seconds)
+        
+        # Get database session
+        db = SessionLocal()
+        
+        try:
+            # Sprawdź czy tabela istnieje
+            from sqlalchemy import inspect
+            inspector = inspect(db.bind)
+            if 'rate_limits' not in inspector.get_table_names():
+                print("⚠ Rate limits table doesn't exist yet - allowing request")
+                return True
+            
+            # Usuń stare wpisy
+            db.execute(
+                """DELETE FROM rate_limits 
+                   WHERE key = :key AND request_time < :window_start""",
+                {"key": key, "window_start": window_start}
+            )
+            db.commit()
+            
+            # Policz aktualne requesty
+            result = db.execute(
+                """SELECT COUNT(*) FROM rate_limits 
+                   WHERE key = :key AND request_time >= :window_start""",
+                {"key": key, "window_start": window_start}
+            )
+            count = result.scalar()
+            
+            print(f"\n=== Rate Limit Check ===")
+            print(f"User: {username}")
+            print(f"Endpoint: {endpoint}")
+            print(f"Requests in window: {count}/{max_requests}")
+            print(f"Window: {window_seconds}s")
+            
+            if count < max_requests:
+                # Dodaj nowy wpis
+                db.execute(
+                    """INSERT INTO rate_limits (key, request_time) 
+                       VALUES (:key, :now)""",
+                    {"key": key, "now": now}
+                )
+                db.commit()
+                print(f"✓ Request allowed ({count + 1}/{max_requests})")
+                return True
+            else:
+                print(f"✗ Rate limit exceeded!")
+                return False
+                
+        except Exception as e:
+            print(f"Rate limit error: {e}")
+            db.rollback()
+            # Jeśli błąd, pozwól na request (fail-open)
+            return True
+        finally:
+            db.close()
+
+
+# Inicjalizacja rate limitera
+rate_limiter = UserRateLimiter()
+
+
+# ═══════════════════════════════════════════════════════════
+# DEPENDENCY FUNCTIONS
+# ═══════════════════════════════════════════════════════════
+
+def get_db():
+    """
+    Database session dependency with connection check.
+    Raises HTTPException if database is not connected.
+    """
+    if not db_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is currently unavailable. Please try again later."
+        )
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_current_user(request: Request, db: Session = Depends(get_db)):
+    """Get current authenticated user from session"""
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+
+# ═══════════════════════════════════════════════════════════
+# RATE LIMITING DEPENDENCY FUNCTIONS
+# ═══════════════════════════════════════════════════════════
+
+async def rate_limit_register(request: Request):
+    """Rate limit: 5 registrations per 5 minutes per IP"""
+    # Dla rejestracji użyj IP (bo user jeszcze nie istnieje)
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Sprawdź forwarded IP z Azure
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    
+    if not rate_limiter.is_allowed(client_ip, "/register", max_requests=5, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many registration attempts. Please wait 5 minutes."
+        )
+
+
+async def rate_limit_login(request: Request):
+    """Rate limit: 5 login attempts per 5 minutes per IP"""
+    # Dla logowania użyj IP (bo user może nie być zalogowany)
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Sprawdź forwarded IP z Azure
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    
+    if not rate_limiter.is_allowed(client_ip, "/login", max_requests=5, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Please wait 5 minutes."
+        )
+
+
+async def rate_limit_create_post(request: Request, current_user: User = Depends(get_current_user)):
+    """Rate limit: 3 posts per 3 minutes per user"""
+    if not rate_limiter.is_allowed(current_user.username, "/create", max_requests=3, window_seconds=180):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
+        )
+
+
+async def rate_limit_comment(request: Request, current_user: User = Depends(get_current_user)):
+    """Rate limit: 30 comments per minute per user"""
+    if not rate_limiter.is_allowed(current_user.username, "/comment", max_requests=30, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many comments. Please wait 1 minute."
+        )
+
+
+# ═══════════════════════════════════════════════════════════
 # FUNKCJE POMOCNICZE DO WALIDACJI
 # ═══════════════════════════════════════════════════════════
 
@@ -484,6 +512,9 @@ def validate_registration_data(username: str, password: str, email: str):
         else:
             errors.append(str(e))
         return False, errors
+
+
+# TUTAJ KONTYNUUJ Z initialize_database() i resztą kodu...
 
 
 def initialize_database():
@@ -718,18 +749,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-# Get current user from session
-def get_current_user(request: Request, db: Session = Depends(get_db)):
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    return user
 
 
 # ═══════════════════════════════════════════════════════════
