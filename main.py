@@ -472,8 +472,7 @@ async def rate_limit_login(request: Request):
         )
 
 
-async def rate_limit_create_post(request: Request, current_user: User = Depends(get_current_user)):
-    """Rate limit: 3 posts per 3 minutes per user"""
+""" async def rate_limit_create_post(request: Request, current_user: User = Depends(get_current_user)):
     if not rate_limiter.is_allowed(current_user.username, "/create", max_requests=3, window_seconds=180):
         raise HTTPException(
             status_code=429,
@@ -482,12 +481,12 @@ async def rate_limit_create_post(request: Request, current_user: User = Depends(
 
 
 async def rate_limit_comment(request: Request, current_user: User = Depends(get_current_user)):
-    """Rate limit: 30 comments per minute per user"""
     if not rate_limiter.is_allowed(current_user.username, "/comment", max_requests=30, window_seconds=60):
         raise HTTPException(
             status_code=429,
             detail="Too many comments. Please wait 1 minute."
         )
+        """
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1152,14 +1151,31 @@ async def create_page(
     )
 
 
-@app.post("/create", dependencies=[Depends(rate_limit_create_post)])
+@app.post("/create")
 async def create(
+    request: Request,
     title: str = Form(...),
     tags: str = Form(""),
     blocks: str = Form(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Tworzy nowy post z rate limitingiem
+    """
+    # === RATE LIMITING - WYKONUJE SIĘ TUTAJ BEZPOŚREDNIO ===
+    print(f"\n🔍 CHECKING RATE LIMIT FOR USER: {current_user.username}")
+    
+    if not rate_limiter.is_allowed(current_user.username, "/create", max_requests=3, window_seconds=180):
+        print(f"❌ RATE LIMIT EXCEEDED FOR {current_user.username}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
+        )
+    
+    print(f"✅ RATE LIMIT OK FOR {current_user.username}")
+    
+    # === RESZTA KODU (bez zmian) ===
     import json as json_lib
 
     clean_title = sanitize_text(title)  # Usuwa WSZYSTKIE HTML
@@ -1295,13 +1311,30 @@ async def react_to_post(
         db.commit()
         return JSONResponse({"status": "success", "action": "added"})
 
-@app.post("/post/{post_id}/comment", dependencies=[Depends(rate_limit_comment)])
+@app.post("/post/{post_id}/comment")
 async def add_comment(
+    request: Request,
     post_id: int,
     content: str = Form(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Dodaje komentarz z rate limitingiem
+    """
+    # === RATE LIMITING - WYKONUJE SIĘ TUTAJ BEZPOŚREDNIO ===
+    print(f"\n🔍 CHECKING RATE LIMIT FOR COMMENT: {current_user.username}")
+    
+    if not rate_limiter.is_allowed(current_user.username, "/comment", max_requests=30, window_seconds=60):
+        print(f"❌ RATE LIMIT EXCEEDED FOR COMMENT: {current_user.username}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many comments. Please wait 1 minute."
+        )
+    
+    print(f"✅ RATE LIMIT OK FOR COMMENT: {current_user.username}")
+    
+    # === RESZTA KODU (bez zmian) ===
     if not content or len(content.strip()) < 1:
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
     if len(content) > 1000:
