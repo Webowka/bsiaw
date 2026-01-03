@@ -348,7 +348,7 @@ class UserRateLimiter:
             from sqlalchemy import inspect
             inspector = inspect(db.bind)
             if 'rate_limits' not in inspector.get_table_names():
-                print("⚠ Rate limits table doesn't exist yet - allowing request")
+                security_logger.warning("⚠ Rate limits table doesn't exist yet - allowing request")
                 return True
             
             # Usuń stare wpisy
@@ -367,11 +367,11 @@ class UserRateLimiter:
             )
             count = result.scalar()
             
-            print(f"\n=== Rate Limit Check ===")
-            print(f"User: {username}")
-            print(f"Endpoint: {endpoint}")
-            print(f"Requests in window: {count}/{max_requests}")
-            print(f"Window: {window_seconds}s")
+            security_logger.info("=== Rate Limit Check ===")
+            security_logger.info(f"User: {username}")
+            security_logger.info(f"Endpoint: {endpoint}")
+            security_logger.info(f"Requests in window: {count}/{max_requests}")
+            security_logger.info(f"Window: {window_seconds}s")
             
             if count < max_requests:
                 # Dodaj nowy wpis
@@ -381,14 +381,14 @@ class UserRateLimiter:
                     {"key": key, "now": now}
                 )
                 db.commit()
-                print(f"✓ Request allowed ({count + 1}/{max_requests})")
+                security_logger.info(f"✓ Request allowed ({count + 1}/{max_requests})")
                 return True
             else:
-                print(f"✗ Rate limit exceeded!")
+                security_logger.warning(f"✗ Rate limit exceeded!")
                 return False
                 
         except Exception as e:
-            print(f"Rate limit error: {e}")
+            security_logger.error(f"Rate limit error: {e}", exc_info=True)
             db.rollback()
             # Jeśli błąd, pozwól na request (fail-open)
             return True
@@ -1163,22 +1163,50 @@ async def create(
     """
     Tworzy nowy post z rate limitingiem
     """
-    # === RATE LIMITING - WYKONUJE SIĘ TUTAJ BEZPOŚREDNIO ===
-    print(f"\n🔍 CHECKING RATE LIMIT FOR USER: {current_user.username}")
+    # === DIAGNOSTIC LOG - ZAWSZE SIĘ WYKONUJE ===
+    security_logger.info("="*80)
+    security_logger.info("🚨 CREATE POST ENDPOINT CALLED - NEW VERSION 2026-01-03-20:20")
+    security_logger.info(f"   User: {current_user.username}")
+    security_logger.info(f"   Title: {title[:50]}")
+    security_logger.info("="*80)
     
-    if not rate_limiter.is_allowed(current_user.username, "/create", max_requests=3, window_seconds=180):
-        print(f"❌ RATE LIMIT EXCEEDED FOR {current_user.username}")
-        raise HTTPException(
-            status_code=429,
-            detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
+    # === SPRAWDŹ CZY RATE_LIMITER ISTNIEJE ===
+    try:
+        security_logger.info(f"🔍 Rate limiter object exists: {rate_limiter is not None}")
+        security_logger.info(f"🔍 Rate limiter type: {type(rate_limiter).__name__}")
+    except Exception as e:
+        security_logger.error(f"❌ ERROR: rate_limiter not found: {e}")
+    
+    # === RATE LIMITING ===
+    try:
+        security_logger.info(f"🔍 Calling rate_limiter.is_allowed()...")
+        allowed = rate_limiter.is_allowed(
+            current_user.username, 
+            "/create", 
+            max_requests=3, 
+            window_seconds=180
         )
+        security_logger.info(f"🔍 Rate limiter returned: {allowed}")
+        
+        if not allowed:
+            security_logger.warning(f"❌ RATE LIMIT EXCEEDED - BLOCKING REQUEST FOR {current_user.username}")
+            raise HTTPException(
+                status_code=429,
+                detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
+            )
+        
+        security_logger.info(f"✅ RATE LIMIT OK - PROCEEDING")
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        security_logger.error(f"❌ RATE LIMITING ERROR: {e}", exc_info=True)
+        security_logger.warning(f"   Allowing request due to error (fail-open)")
     
-    print(f"✅ RATE LIMIT OK FOR {current_user.username}")
-    
-    # === RESZTA KODU (bez zmian) ===
+    # === RESZTA KODU ===
     import json as json_lib
 
-    clean_title = sanitize_text(title)  # Usuwa WSZYSTKIE HTML
+    clean_title = sanitize_text(title)
     new_post = Post(
         title=clean_title,
         content="",
@@ -1205,7 +1233,7 @@ async def create(
         for idx, block in enumerate(blocks_data):
             block_type = block.get('type')
             if block_type == 'text':
-                clean_block_content = sanitize_html_content(block.get('content', ''))  # Bezpieczne HTML
+                clean_block_content = sanitize_html_content(block.get('content', ''))
                 content_block = ContentBlock(
                     content=clean_block_content,
                     post_id=new_post.id,
@@ -1223,9 +1251,12 @@ async def create(
                 db.add(content_block)
     except Exception as e:
         db.rollback()
+        security_logger.error(f"❌ ERROR SAVING BLOCKS: {e}")
         return RedirectResponse(url="/create?error=Failed to save content blocks", status_code=303)
 
     db.commit()
+    security_logger.info(f"✅ POST CREATED SUCCESSFULLY by {current_user.username}")
+    security_logger.info("="*80)
     return RedirectResponse(url="/main", status_code=303)
 
 
@@ -1578,3 +1609,24 @@ async def admin_delete_thread(
     db.delete(thread)
     db.commit()
     return JSONResponse({"status": "success", "message": "Thread deleted"})
+
+
+# ===== STARTUP DIAGNOSTIC =====
+security_logger.info("🔥"*40)
+security_logger.info("APPLICATION STARTED - VERSION 2026-01-03-20:30")
+security_logger.info(f"Rate limiter initialized: {rate_limiter is not None}")
+security_logger.info("🔥"*40)
+
+
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("TESTING RATE LIMITER")
+    print("="*80)
+    # Test czy rate_limiter działa
+    result1 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
+    print(f"Request 1: {result1}")
+    result2 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
+    print(f"Request 2: {result2}")
+    result3 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
+    print(f"Request 3 (should be False): {result3}")
+    print("="*80 + "\n")
