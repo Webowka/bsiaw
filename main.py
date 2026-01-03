@@ -23,33 +23,28 @@ from pathlib import Path
 from collections import defaultdict
 from threading import Lock
 
-# ===== ZAMIEŃ LINIE 27-143 NA TEN KOD =====
+# ===== RATE LIMITING Z POSTGRESQL - ZAWSZE AKTYWNY =====
 
-# ===== RATE LIMITING Z POSTGRESQL =====
 class DatabaseRateLimiter:
     """Rate limiter using PostgreSQL database"""
     
     def _get_client_ip(self, request: Request) -> str:
         """Get real client IP from Azure proxy headers"""
-        # Azure Application Gateway / Front Door headers
         forwarded_for = request.headers.get("X-Forwarded-For")
         if forwarded_for:
             return forwarded_for.split(",")[0].strip()
         
-        # Azure Load Balancer header
         real_ip = request.headers.get("X-Real-IP")
         if real_ip:
             return real_ip.strip()
         
-        # Azure specific headers
         azure_client_ip = request.headers.get("X-Azure-ClientIP")
         if azure_client_ip:
             return azure_client_ip.strip()
         
-        # Fallback
         return request.client.host if request.client else "unknown"
     
-    def is_allowed(self, request: Request, db: Session, max_requests: int, window_seconds: int) -> bool:
+    def is_allowed(self, request: Request, max_requests: int, window_seconds: int) -> bool:
         """Check if request is allowed under rate limit"""
         client_ip = self._get_client_ip(request)
         endpoint = request.url.path
@@ -58,32 +53,50 @@ class DatabaseRateLimiter:
         now = datetime.utcnow()
         window_start = now - timedelta(seconds=window_seconds)
         
+        # Get database session
+        db = SessionLocal()
+        
         try:
-            # Import RateLimitEntry here to avoid circular import
-            from main import RateLimitEntry
+            # RateLimitEntry będzie dostępny gdy tabela zostanie utworzona
+            # Sprawdź czy tabela istnieje
+            from sqlalchemy import inspect
+            inspector = inspect(db.bind)
+            if 'rate_limits' not in inspector.get_table_names():
+                print("⚠ Rate limits table doesn't exist yet - skipping")
+                return True
             
-            # Clean old entries (older than window)
-            db.query(RateLimitEntry).filter(
-                RateLimitEntry.key == key,
-                RateLimitEntry.request_time < window_start
-            ).delete(synchronize_session=False)
+            # Clean old entries
+            db.execute(
+                """DELETE FROM rate_limits 
+                   WHERE key = :key AND request_time < :window_start""",
+                {"key": key, "window_start": window_start}
+            )
             
-            # Count requests in current window
-            count = db.query(RateLimitEntry).filter(
-                RateLimitEntry.key == key,
-                RateLimitEntry.request_time >= window_start
-            ).count()
+            # Count requests
+            result = db.execute(
+                """SELECT COUNT(*) FROM rate_limits 
+                   WHERE key = :key AND request_time >= :window_start""",
+                {"key": key, "window_start": window_start}
+            )
+            count = result.scalar()
+            
+            print(f"\n=== Rate Limit Check ===")
+            print(f"Endpoint: {endpoint}")
+            print(f"Client IP: {client_ip}")
+            print(f"Current requests: {count}/{max_requests}")
             
             if count < max_requests:
                 # Add new entry
-                new_entry = RateLimitEntry(
-                    key=key,
-                    request_time=now
+                db.execute(
+                    """INSERT INTO rate_limits (key, request_time) 
+                       VALUES (:key, :now)""",
+                    {"key": key, "now": now}
                 )
-                db.add(new_entry)
                 db.commit()
+                print(f"✓ Request allowed ({count + 1}/{max_requests})")
                 return True
             else:
+                print(f"✗ Rate limit exceeded!")
                 return False
                 
         except Exception as e:
@@ -91,103 +104,48 @@ class DatabaseRateLimiter:
             db.rollback()
             # Fail-open: allow request if there's an error
             return True
+        finally:
+            db.close()
 
 
 rate_limiter = DatabaseRateLimiter()
 
 
-# ===== ASYNC DEPENDENCY FUNCTIONS =====
+# ===== ASYNC DEPENDENCY FUNCTIONS - BEZ SKIPOWANIA =====
 async def rate_limit_register(request: Request):
     """Rate limit: 5 registrations per 5 minutes"""
-    # Skip in test environment
-    db_url = os.getenv("DATABASE_URL", "")
-    if (os.getenv("TESTING") == "true" or
-        "testdb" in db_url or
-        "testuser" in db_url or
-        ":5434/" in db_url):
-        return
-    
-    # Get database session
-    db = SessionLocal()
-    try:
-        if not rate_limiter.is_allowed(request, db, max_requests=5, window_seconds=300):
-            client_ip = rate_limiter._get_client_ip(request)
-            raise HTTPException(
-                status_code=429,
-                detail="Too many registration attempts. Please wait 5 minutes before trying again."
-            )
-    finally:
-        db.close()
+    if not rate_limiter.is_allowed(request, max_requests=5, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many registration attempts. Please wait 5 minutes."
+        )
 
 
 async def rate_limit_login(request: Request):
     """Rate limit: 3 login attempts per 5 minutes"""
-    # Skip in test environment
-    db_url = os.getenv("DATABASE_URL", "")
-    if (os.getenv("TESTING") == "true" or
-        "testdb" in db_url or
-        "testuser" in db_url or
-        ":5434/" in db_url):
-        return
-    
-    # Get database session
-    db = SessionLocal()
-    try:
-        if not rate_limiter.is_allowed(request, db, max_requests=3, window_seconds=300):
-            client_ip = rate_limiter._get_client_ip(request)
-            raise HTTPException(
-                status_code=429,
-                detail="Too many login attempts. Please wait 5 minutes before trying again."
-            )
-    finally:
-        db.close()
+    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Please wait 5 minutes."
+        )
 
 
 async def rate_limit_create_post(request: Request):
     """Rate limit: 3 posts per 3 minutes"""
-    # Skip in test environment
-    db_url = os.getenv("DATABASE_URL", "")
-    if (os.getenv("TESTING") == "true" or
-        "testdb" in db_url or
-        "testuser" in db_url or
-        ":5434/" in db_url):
-        return
-    
-    # Get database session
-    db = SessionLocal()
-    try:
-        if not rate_limiter.is_allowed(request, db, max_requests=3, window_seconds=180):
-            client_ip = rate_limiter._get_client_ip(request)
-            raise HTTPException(
-                status_code=429,
-                detail="Too many posts. Please wait 3 minutes before posting again."
-            )
-    finally:
-        db.close()
+    if not rate_limiter.is_allowed(request, max_requests=3, window_seconds=180):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many posts. Please wait 3 minutes before posting again."
+        )
 
 
 async def rate_limit_comment(request: Request):
     """Rate limit: 30 comments per minute"""
-    # Skip in test environment
-    db_url = os.getenv("DATABASE_URL", "")
-    if (os.getenv("TESTING") == "true" or
-        "testdb" in db_url or
-        "testuser" in db_url or
-        ":5434/" in db_url):
-        return
-    
-    # Get database session
-    db = SessionLocal()
-    try:
-        if not rate_limiter.is_allowed(request, db, max_requests=30, window_seconds=60):
-            client_ip = rate_limiter._get_client_ip(request)
-            raise HTTPException(
-                status_code=429,
-                detail="Too many comments. Please wait 1 minute before commenting again."
-            )
-    finally:
-        db.close()
-
+    if not rate_limiter.is_allowed(request, max_requests=30, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many comments. Please wait 1 minute."
+        )
 # Configure logging for security events - console only
 logging.basicConfig(
     level=logging.INFO,
