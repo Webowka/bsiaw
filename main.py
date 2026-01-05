@@ -31,6 +31,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from fastapi import Request
+
 
 # Configure logging for security events - console only
 logging.basicConfig(
@@ -1154,6 +1156,7 @@ async def create(
 @app.post("/upload-image")
 @limiter.limit("3/minute")  # LIMIT DOSTĘPU DO ZASOBU
 async def upload_image(
+    request: Request,
     image: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
@@ -1193,6 +1196,7 @@ async def upload_video(
 @app.post("/post/{post_id}/react")
 @limiter.limit("3/minute")  # LIMIT WYWOŁAŃ API
 async def react_to_post(
+    request: Request,
     post_id: int,
     reaction_type: str = Form(...),
     db: Session = Depends(get_db),
