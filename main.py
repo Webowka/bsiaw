@@ -31,7 +31,6 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.storage import MemoryStorage
 
 # Configure logging for security events - console only
 logging.basicConfig(
@@ -465,10 +464,7 @@ app = FastAPI()
 
 ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "true") == "true"
 
-limiter = Limiter(
-    key_func=get_remote_address,
-    storage=MemoryStorage()  # w prod możesz podmienić na Redis
-)
+limiter = Limiter(key_func=get_remote_address)
 
 if ENABLE_RATE_LIMITING:
     app.state.limiter = limiter
