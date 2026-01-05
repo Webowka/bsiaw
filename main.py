@@ -715,7 +715,7 @@ async def register(
     email: str = Form(...),
     db: Session = Depends(get_db)
 ):
-        if not username:
+    if not username:
         raise HTTPException(status_code=400, detail="Username required")
 
     if not password:
@@ -819,7 +819,7 @@ async def login(
     db: Session = Depends(get_db)
 ):
     if not username or not password:
-    raise HTTPException(status_code=400, detail="Username and password required")
+        raise HTTPException(status_code=400, detail="Username and password required")
     """
     LOGOWANIE Z WALIDACJĄ I MONITOROWANIEM
 
