@@ -1,4 +1,6 @@
-fastapi==0.124.2
+fastapi==0.115.6
+redis==5.2.1
+slowapi==0.1.9
 uvicorn==0.24.0
 gunicorn==23.0.0
 sqlalchemy==2.0.23

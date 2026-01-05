@@ -22,6 +22,18 @@ import logging
 from pathlib import Path
 from collections import defaultdict
 from threading import Lock
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import redis
+import os
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from fastapi import Request
+from pydantic import constr
+
 
 # Configure logging for security events - console only
 logging.basicConfig(
@@ -327,80 +339,6 @@ class PostRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# RATE LIMITING - MUSI BYĆ PO DEFINICJI WSZYSTKICH MODELI
-# ═══════════════════════════════════════════════════════════
-
-class UserRateLimiter:
-    """Simple rate limiter based on username"""
-    
-    def is_allowed(self, username: str, endpoint: str, max_requests: int, window_seconds: int) -> bool:
-        """Check if user is allowed to make request"""
-        key = f"{endpoint}:{username}"
-        
-        now = datetime.utcnow()
-        window_start = now - timedelta(seconds=window_seconds)
-        
-        # Get database session
-        db = SessionLocal()
-        
-        try:
-            # Sprawdź czy tabela istnieje
-            from sqlalchemy import inspect
-            inspector = inspect(db.bind)
-            if 'rate_limits' not in inspector.get_table_names():
-                security_logger.warning("⚠ Rate limits table doesn't exist yet - allowing request")
-                return True
-            
-            # Usuń stare wpisy
-            db.execute(
-                """DELETE FROM rate_limits 
-                   WHERE key = :key AND request_time < :window_start""",
-                {"key": key, "window_start": window_start}
-            )
-            db.commit()
-            
-            # Policz aktualne requesty
-            result = db.execute(
-                """SELECT COUNT(*) FROM rate_limits 
-                   WHERE key = :key AND request_time >= :window_start""",
-                {"key": key, "window_start": window_start}
-            )
-            count = result.scalar()
-            
-            security_logger.info("=== Rate Limit Check ===")
-            security_logger.info(f"User: {username}")
-            security_logger.info(f"Endpoint: {endpoint}")
-            security_logger.info(f"Requests in window: {count}/{max_requests}")
-            security_logger.info(f"Window: {window_seconds}s")
-            
-            if count < max_requests:
-                # Dodaj nowy wpis
-                db.execute(
-                    """INSERT INTO rate_limits (key, request_time) 
-                       VALUES (:key, :now)""",
-                    {"key": key, "now": now}
-                )
-                db.commit()
-                security_logger.info(f"✓ Request allowed ({count + 1}/{max_requests})")
-                return True
-            else:
-                security_logger.warning(f"✗ Rate limit exceeded!")
-                return False
-                
-        except Exception as e:
-            security_logger.error(f"Rate limit error: {e}", exc_info=True)
-            db.rollback()
-            # Jeśli błąd, pozwól na request (fail-open)
-            return True
-        finally:
-            db.close()
-
-
-# Inicjalizacja rate limitera
-rate_limiter = UserRateLimiter()
-
-
-# ═══════════════════════════════════════════════════════════
 # DEPENDENCY FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 
@@ -432,61 +370,6 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="User not found")
 
     return user
-
-
-# ═══════════════════════════════════════════════════════════
-# RATE LIMITING DEPENDENCY FUNCTIONS
-# ═══════════════════════════════════════════════════════════
-
-async def rate_limit_register(request: Request):
-    """Rate limit: 5 registrations per 5 minutes per IP"""
-    # Dla rejestracji użyj IP (bo user jeszcze nie istnieje)
-    client_ip = request.client.host if request.client else "unknown"
-    
-    # Sprawdź forwarded IP z Azure
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    
-    if not rate_limiter.is_allowed(client_ip, "/register", max_requests=5, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many registration attempts. Please wait 5 minutes."
-        )
-
-
-async def rate_limit_login(request: Request):
-    """Rate limit: 5 login attempts per 5 minutes per IP"""
-    # Dla logowania użyj IP (bo user może nie być zalogowany)
-    client_ip = request.client.host if request.client else "unknown"
-    
-    # Sprawdź forwarded IP z Azure
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    
-    if not rate_limiter.is_allowed(client_ip, "/login", max_requests=5, window_seconds=300):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many login attempts. Please wait 5 minutes."
-        )
-
-
-""" async def rate_limit_create_post(request: Request, current_user: User = Depends(get_current_user)):
-    if not rate_limiter.is_allowed(current_user.username, "/create", max_requests=3, window_seconds=180):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
-        )
-
-
-async def rate_limit_comment(request: Request, current_user: User = Depends(get_current_user)):
-    if not rate_limiter.is_allowed(current_user.username, "/comment", max_requests=30, window_seconds=60):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many comments. Please wait 1 minute."
-        )
-        """
 
 
 # ═══════════════════════════════════════════════════════════
@@ -581,6 +464,51 @@ def initialize_database():
 initialize_database()
 
 app = FastAPI()
+
+ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "true") == "true"
+
+limiter = Limiter(key_func=get_remote_address)
+
+if ENABLE_RATE_LIMITING:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, lambda r, e: JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded"}
+    ))
+    app.add_middleware(SlowAPIMiddleware)
+
+
+# Funkcja do pobierania klucza rate limitingu
+def get_rate_limit_key(request: Request) -> str:
+    user_id = request.session.get("user_id")
+    if user_id:
+        username = request.session.get("username", "unknown")
+        return f"user:{username}"
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return f"ip:{forwarded.split(',')[0].strip()}"
+    return f"ip:{request.client.host if request.client else 'unknown'}"
+
+# Inicjalizacja limitera
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    # Użyj Redis jeśli dostępny
+    limiter = Limiter(
+        key_func=get_rate_limit_key,
+        storage_uri=REDIS_URL
+    )
+    print("✓ Rate limiting using Redis")
+else:
+    # FALLBACK: Użyj memory (nie idealne, ale zadziała dla testów)
+    limiter = Limiter(
+        key_func=get_rate_limit_key,
+        storage_uri="memory://"
+    )
+    print("⚠ Rate limiting using memory (not recommended for production)")
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Custom exception handler to mask internal errors
 @app.exception_handler(Exception)
@@ -779,7 +707,7 @@ async def register_page(request: Request):
     })
 
 
-@app.post("/register", dependencies=[Depends(rate_limit_register)])
+@app.post("/register")
 async def register(
     request: Request,
     username: str = Form(...),
@@ -787,6 +715,11 @@ async def register(
     email: str = Form(...),
     db: Session = Depends(get_db)
 ):
+    if not username:
+        raise HTTPException(status_code=400, detail="Username required")
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Password required")
     """
     REJESTRACJA Z PEŁNĄ WALIDACJĄ
 
@@ -878,13 +811,15 @@ async def login_page(request: Request):
     })
 
 
-@app.post("/login", dependencies=[Depends(rate_limit_login)])
+@app.post("/login")
 async def login(
     request: Request,
     username: str = Form(...),
     password: str = Form(...),
     db: Session = Depends(get_db)
 ):
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
     """
     LOGOWANIE Z WALIDACJĄ I MONITOROWANIEM
 
@@ -1152,6 +1087,7 @@ async def create_page(
 
 
 @app.post("/create")
+@limiter.limit("2/3minutes")  # 2 posty / 3 minuty per user
 async def create(
     request: Request,
     title: str = Form(...),
@@ -1163,45 +1099,6 @@ async def create(
     """
     Tworzy nowy post z rate limitingiem
     """
-    # === DIAGNOSTIC LOG - ZAWSZE SIĘ WYKONUJE ===
-    security_logger.info("="*80)
-    security_logger.info("🚨 CREATE POST ENDPOINT CALLED - NEW VERSION 2026-01-03-20:20")
-    security_logger.info(f"   User: {current_user.username}")
-    security_logger.info(f"   Title: {title[:50]}")
-    security_logger.info("="*80)
-    
-    # === SPRAWDŹ CZY RATE_LIMITER ISTNIEJE ===
-    try:
-        security_logger.info(f"🔍 Rate limiter object exists: {rate_limiter is not None}")
-        security_logger.info(f"🔍 Rate limiter type: {type(rate_limiter).__name__}")
-    except Exception as e:
-        security_logger.error(f"❌ ERROR: rate_limiter not found: {e}")
-    
-    # === RATE LIMITING ===
-    try:
-        security_logger.info(f"🔍 Calling rate_limiter.is_allowed()...")
-        allowed = rate_limiter.is_allowed(
-            current_user.username, 
-            "/create", 
-            max_requests=3, 
-            window_seconds=180
-        )
-        security_logger.info(f"🔍 Rate limiter returned: {allowed}")
-        
-        if not allowed:
-            security_logger.warning(f"❌ RATE LIMIT EXCEEDED - BLOCKING REQUEST FOR {current_user.username}")
-            raise HTTPException(
-                status_code=429,
-                detail="Too many posts. You can create maximum 3 posts per 3 minutes. Please wait before posting again."
-            )
-        
-        security_logger.info(f"✅ RATE LIMIT OK - PROCEEDING")
-        
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
-    except Exception as e:
-        security_logger.error(f"❌ RATE LIMITING ERROR: {e}", exc_info=True)
-        security_logger.warning(f"   Allowing request due to error (fail-open)")
     
     # === RESZTA KODU ===
     import json as json_lib
@@ -1265,12 +1162,12 @@ async def create(
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/upload-image")
+@limiter.limit("3/minute")  # LIMIT DOSTĘPU DO ZASOBU
 async def upload_image(
+    request: Request,
     image: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    if not image.content_type or not image.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="File must be an image")
     file_ext = Path(image.filename).suffix
     unique_filename = f"{uuid.uuid4()}{file_ext}"
     file_path = UPLOAD_DIR / unique_filename
@@ -1305,7 +1202,9 @@ async def upload_video(
     })
 
 @app.post("/post/{post_id}/react")
+@limiter.limit("3/minute")  # LIMIT WYWOŁAŃ API
 async def react_to_post(
+    request: Request,
     post_id: int,
     reaction_type: str = Form(...),
     db: Session = Depends(get_db),
@@ -1343,8 +1242,9 @@ async def react_to_post(
         return JSONResponse({"status": "success", "action": "added"})
 
 @app.post("/post/{post_id}/comment")
+@limiter.limit("10/minute")  # 10 komentarzy / minutę per user
 async def add_comment(
-    request: Request,
+    request: Request, 
     post_id: int,
     content: str = Form(...),
     db: Session = Depends(get_db),
@@ -1355,13 +1255,6 @@ async def add_comment(
     """
     # === RATE LIMITING - WYKONUJE SIĘ TUTAJ BEZPOŚREDNIO ===
     print(f"\n🔍 CHECKING RATE LIMIT FOR COMMENT: {current_user.username}")
-    
-    if not rate_limiter.is_allowed(current_user.username, "/comment", max_requests=30, window_seconds=60):
-        print(f"❌ RATE LIMIT EXCEEDED FOR COMMENT: {current_user.username}")
-        raise HTTPException(
-            status_code=429,
-            detail="Too many comments. Please wait 1 minute."
-        )
     
     print(f"✅ RATE LIMIT OK FOR COMMENT: {current_user.username}")
     
@@ -1609,24 +1502,3 @@ async def admin_delete_thread(
     db.delete(thread)
     db.commit()
     return JSONResponse({"status": "success", "message": "Thread deleted"})
-
-
-# ===== STARTUP DIAGNOSTIC =====
-security_logger.info("🔥"*40)
-security_logger.info("APPLICATION STARTED - VERSION 2026-01-03-20:30")
-security_logger.info(f"Rate limiter initialized: {rate_limiter is not None}")
-security_logger.info("🔥"*40)
-
-
-if __name__ == "__main__":
-    print("\n" + "="*80)
-    print("TESTING RATE LIMITER")
-    print("="*80)
-    # Test czy rate_limiter działa
-    result1 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 1: {result1}")
-    result2 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 2: {result2}")
-    result3 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 3 (should be False): {result3}")
-    print("="*80 + "\n")
