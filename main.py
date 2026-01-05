@@ -32,6 +32,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from fastapi import Request
+from pydantic import constr
 
 
 # Configure logging for security events - console only
@@ -714,6 +715,11 @@ async def register(
     email: str = Form(...),
     db: Session = Depends(get_db)
 ):
+        if not username:
+        raise HTTPException(status_code=400, detail="Username required")
+
+    if not password:
+        raise HTTPException(status_code=400, detail="Password required")
     """
     REJESTRACJA Z PEŁNĄ WALIDACJĄ
 
@@ -812,6 +818,8 @@ async def login(
     password: str = Form(...),
     db: Session = Depends(get_db)
 ):
+    if not username or not password:
+    raise HTTPException(status_code=400, detail="Username and password required")
     """
     LOGOWANIE Z WALIDACJĄ I MONITOROWANIEM
 
