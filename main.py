@@ -1073,37 +1073,6 @@ async def create(
     """
     Tworzy nowy post z rate limitingiem
     """
-    # === DIAGNOSTIC LOG - ZAWSZE SIĘ WYKONUJE ===
-    security_logger.info("="*80)
-    security_logger.info("🚨 CREATE POST ENDPOINT CALLED - NEW VERSION 2026-01-03-20:20")
-    security_logger.info(f"   User: {current_user.username}")
-    security_logger.info(f"   Title: {title[:50]}")
-    security_logger.info("="*80)
-    
-    # === SPRAWDŹ CZY RATE_LIMITER ISTNIEJE ===
-    try:
-        security_logger.info(f"🔍 Rate limiter object exists: {rate_limiter is not None}")
-        security_logger.info(f"🔍 Rate limiter type: {type(rate_limiter).__name__}")
-    except Exception as e:
-        security_logger.error(f"❌ ERROR: rate_limiter not found: {e}")
-    
-    # === RATE LIMITING ===
-    try:
-        security_logger.info(f"🔍 Calling rate_limiter.is_allowed()...")
-        allowed = rate_limiter.is_allowed(
-            current_user.username, 
-            "/create", 
-            max_requests=3, 
-            window_seconds=180
-        )
-        security_logger.info(f"🔍 Rate limiter returned: {allowed}")
-        security_logger.info(f"✅ RATE LIMIT OK - PROCEEDING")
-        
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
-    except Exception as e:
-        security_logger.error(f"❌ RATE LIMITING ERROR: {e}", exc_info=True)
-        security_logger.warning(f"   Allowing request due to error (fail-open)")
     
     # === RESZTA KODU ===
     import json as json_lib
@@ -1503,24 +1472,3 @@ async def admin_delete_thread(
     db.delete(thread)
     db.commit()
     return JSONResponse({"status": "success", "message": "Thread deleted"})
-
-
-# ===== STARTUP DIAGNOSTIC =====
-security_logger.info("🔥"*40)
-security_logger.info("APPLICATION STARTED - VERSION 2026-01-03-20:30")
-security_logger.info(f"Rate limiter initialized: {rate_limiter is not None}")
-security_logger.info("🔥"*40)
-
-
-if __name__ == "__main__":
-    print("\n" + "="*80)
-    print("TESTING RATE LIMITER")
-    print("="*80)
-    # Test czy rate_limiter działa
-    result1 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 1: {result1}")
-    result2 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 2: {result2}")
-    result3 = rate_limiter.is_allowed("testuser", "/test", max_requests=2, window_seconds=60)
-    print(f"Request 3 (should be False): {result3}")
-    print("="*80 + "\n")
