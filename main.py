@@ -26,6 +26,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import redis
+import os
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.storage import MemoryStorage
 
 # Configure logging for security events - console only
 logging.basicConfig(
@@ -457,6 +463,22 @@ initialize_database()
 
 app = FastAPI()
 
+ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "true") == "true"
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage=MemoryStorage()  # w prod możesz podmienić na Redis
+)
+
+if ENABLE_RATE_LIMITING:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, lambda r, e: JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded"}
+    ))
+    app.add_middleware(SlowAPIMiddleware)
+
+
 # Funkcja do pobierania klucza rate limitingu
 def get_rate_limit_key(request: Request) -> str:
     user_id = request.session.get("user_id")
@@ -687,7 +709,6 @@ async def register_page(request: Request):
 
 
 @app.post("/register")
-@limiter.limit("5/5minutes")  # 5 rejestracji / 5 minut per IP
 async def register(
     request: Request,
     username: str = Form(...),
@@ -787,7 +808,6 @@ async def login_page(request: Request):
 
 
 @app.post("/login")
-@limiter.limit("2/5minutes")  # 2 logowania / 5 minut per IP
 async def login(
     request: Request,
     username: str = Form(...),
@@ -1136,6 +1156,7 @@ async def create(
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/upload-image")
+@limiter.limit("3/minute")  # LIMIT DOSTĘPU DO ZASOBU
 async def upload_image(
     image: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
@@ -1174,6 +1195,7 @@ async def upload_video(
     })
 
 @app.post("/post/{post_id}/react")
+@limiter.limit("3/minute")  # LIMIT WYWOŁAŃ API
 async def react_to_post(
     post_id: int,
     reaction_type: str = Form(...),
