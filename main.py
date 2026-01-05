@@ -1242,7 +1242,7 @@ async def react_to_post(
         return JSONResponse({"status": "success", "action": "added"})
 
 @app.post("/post/{post_id}/comment")
-@limiter.limit("10/minute")  # 10 komentarzy / minutę per user
+@limiter.limit("1/minute")  # 1 komentarz / minutę per user
 async def add_comment(
     request: Request, 
     post_id: int,
