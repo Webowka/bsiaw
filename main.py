@@ -13,6 +13,8 @@ from security.asgi_middleware import AddSecurityHeadersMiddleware
 from security.csrf import CSRFMiddleware, generate_csrf_token
 from security.session_management import SessionTimeoutMiddleware, init_session
 from security.xss_protection import sanitize_text, sanitize_html_content, sanitize_username, sanitize_filename
+from security.rbac import RBACManager, Permission, AccessControlAuditor
+from security.input_validation import CommentRequest, ThreadRequest, ThreadMessageRequest, JSONPayloadValidator, InputValidator
 import os
 import time
 import re
@@ -1320,11 +1322,17 @@ async def admin_delete_post(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.is_admin != 1:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    # RBAC: Check admin permission (Lab 7 - Task 1.d)
+    RBACManager.require_permission(current_user, Permission.DELETE_ANY_POST)
+
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+
+    # Audit log for admin action
+    AccessControlAuditor.log_access_granted(current_user, "post", post_id, "delete")
+    security_logger.info(f"Admin {current_user.username} deleted post {post_id}")
+
     db.delete(post)
     db.commit()
     return JSONResponse({"status": "success", "message": "Post deleted"})
@@ -1335,11 +1343,17 @@ async def admin_delete_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.is_admin != 1:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    # RBAC: Check admin permission (Lab 7 - Task 1.d)
+    RBACManager.require_permission(current_user, Permission.DELETE_ANY_COMMENT)
+
     comment = db.query(Comment).filter(Comment.id == comment_id).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
+
+    # Audit log for admin action
+    AccessControlAuditor.log_access_granted(current_user, "comment", comment_id, "delete")
+    security_logger.info(f"Admin {current_user.username} deleted comment {comment_id}")
+
     db.delete(comment)
     db.commit()
     return JSONResponse({"status": "success", "message": "Comment deleted"})
@@ -1487,18 +1501,25 @@ async def admin_delete_thread(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.is_admin != 1:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    # RBAC: Check admin permission (Lab 7 - Task 1.d)
+    RBACManager.require_permission(current_user, Permission.DELETE_ANY_THREAD)
+
     thread = db.query(Thread).filter(Thread.id == thread_id).first()
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Audit log for admin action
+    AccessControlAuditor.log_access_granted(current_user, "thread", thread_id, "delete")
+    security_logger.info(f"Admin {current_user.username} deleted thread {thread_id}")
+
     for attachment in thread.attachments:
         try:
             file_path = Path(attachment.filepath)
             if file_path.exists():
                 file_path.unlink()
         except Exception as e:
-            print(f"Failed to delete file {attachment.filepath}: {e}")
+            security_logger.warning(f"Failed to delete file {attachment.filepath}: {e}")
+
     db.delete(thread)
     db.commit()
     return JSONResponse({"status": "success", "message": "Thread deleted"})
