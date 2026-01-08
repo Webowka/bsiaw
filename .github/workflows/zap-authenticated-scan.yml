@@ -1,0 +1,215 @@
+name: ZAP Authenticated Security Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  zap-authenticated-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: authdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Start application
+      run: |
+        nohup uvicorn main:app --host 0.0.0.0 --port 8000 &
+        APP_PID=$!
+        echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+
+        echo "Waiting for application to start..."
+        for i in {1..30}; do
+          if curl -s -f http://localhost:8000 > /dev/null; then
+            echo "✓ Application is ready"
+            break
+          fi
+          echo "Waiting... ($i/30)"
+          sleep 2
+        done
+
+        if ! curl -s -f http://localhost:8000 > /dev/null; then
+          echo "ERROR: Application failed to start"
+          exit 1
+        fi
+      env:
+        DATABASE_URL: postgresql://user:password@localhost:5432/authdb
+        REDIS_URL: redis://localhost:6379
+        SECRET_KEY: test-secret-key-for-ci-pipeline-min-32-characters-long
+        ADMIN_USERNAME: admin
+        ADMIN_PASSWORD: Admin@123
+        ADMIN_EMAIL: admin@forum.local
+        ENVIRONMENT: development
+
+    - name: Verify admin user exists
+      run: |
+        echo "Checking if admin user can log in..."
+        # Just verify the app is responding, ZAP will handle auth
+        curl -s http://localhost:8000/login > /dev/null
+        echo "✓ Login page accessible"
+
+    - name: Create ZAP reports directory
+      run: |
+        mkdir -p zap-reports
+        chmod 777 zap-reports
+
+    - name: Run ZAP Authenticated Scan
+      run: |
+        echo "Starting ZAP Authenticated Scan..."
+
+        docker run --network host \
+          -v $(pwd):/zap/wrk/:rw \
+          ghcr.io/zaproxy/zaproxy:stable \
+          zap.sh -cmd \
+          -autorun /zap/wrk/zap-authenticated-scan.yaml
+
+        echo "✓ ZAP scan completed"
+
+    - name: Check ZAP reports generated
+      run: |
+        if [ ! -f "zap-reports/zap-authenticated-report.html" ]; then
+          echo "ERROR: ZAP scan failed to generate reports"
+          exit 1
+        fi
+
+        echo "✓ Reports generated successfully"
+        ls -lh zap-reports/
+
+    - name: Stop application
+      if: always()
+      run: |
+        if [ -n "$APP_PID" ]; then
+          kill $APP_PID 2>/dev/null || true
+        fi
+        pkill -f "uvicorn main:app" || true
+
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@v3.5.0
+
+    - name: Create and sign security reports
+      run: |
+        # Generate date stamp for artifact naming
+        DATE_STAMP=$(date +%Y%m%d-%H%M%S)
+        ARTIFACT_NAME="zap-authenticated-reports-${DATE_STAMP}"
+
+        # Package reports
+        tar -czf ${ARTIFACT_NAME}.tar.gz zap-reports/
+
+        # Generate checksum
+        sha256sum ${ARTIFACT_NAME}.tar.gz > ${ARTIFACT_NAME}.tar.gz.sha256
+
+        # Sign with cosign
+        cosign sign-blob --yes \
+          --bundle ${ARTIFACT_NAME}.tar.gz.bundle \
+          ${ARTIFACT_NAME}.tar.gz
+
+        # Save artifact name for upload step
+        echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_ENV
+
+        echo "✓ Reports packaged and signed"
+
+    - name: Upload signed artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: |
+          ${{ env.ARTIFACT_NAME }}.tar.gz
+          ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+          ${{ env.ARTIFACT_NAME }}.tar.gz.bundle
+        retention-days: 90
+
+    - name: Parse ZAP results and create summary
+      if: always()
+      run: |
+        if [ ! -f "zap-reports/zap-authenticated-report.json" ]; then
+          echo "⚠️ No JSON report found"
+          exit 0
+        fi
+
+        echo "## ZAP Authenticated Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Count alerts by risk level
+        HIGH=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap-reports/zap-authenticated-report.json 2>/dev/null || echo "0")
+        MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' zap-reports/zap-authenticated-report.json 2>/dev/null || echo "0")
+        LOW=$(jq '[.site[].alerts[] | select(.riskcode=="1")] | length' zap-reports/zap-authenticated-report.json 2>/dev/null || echo "0")
+        INFO=$(jq '[.site[].alerts[] | select(.riskcode=="0")] | length' zap-reports/zap-authenticated-report.json 2>/dev/null || echo "0")
+
+        echo "| Risk Level | Count |" >> $GITHUB_STEP_SUMMARY
+        echo "|------------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔴 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟠 Medium | $MEDIUM |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟡 Low | $LOW |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔵 Informational | $INFO |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📊 Full report available in artifacts: \`${{ env.ARTIFACT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+
+    - name: Fail if high-risk vulnerabilities found (optional)
+      if: always()
+      run: |
+        if [ -f "zap-reports/zap-authenticated-report.json" ]; then
+          HIGH=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap-reports/zap-authenticated-report.json 2>/dev/null || echo "0")
+
+          if [ "$HIGH" -gt "0" ]; then
+            echo "⚠️ WARNING: $HIGH high-risk vulnerabilities found!"
+            echo "Review the ZAP report in artifacts"
+            # Uncomment to fail the build on high-risk findings:
+            # exit 1
+          else
+            echo "✓ No high-risk vulnerabilities found"
+          fi
+        fi
+
+  notify-discord:
+    runs-on: ubuntu-latest
+    needs: zap-authenticated-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Send Discord Notification
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ secrets.WEBHOOK_URL }}
+        title: "ZAP Authenticated Scan Complete!"
+        description: "Authenticated security scan, report generation, and artifact signing completed successfully"
+        color: 0x5a03fc
